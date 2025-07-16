@@ -1,162 +1,187 @@
-from flask import Flask, render_template, request, redirect, session
-from flask_mail import Mail, Message
-import boto3
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+from datetime import datetime, timedelta
+from functools import wraps
+import hashlib
 import uuid
-from datetime import datetime
 
-app = Flask(_name_)
-app.secret_key = 'your_secret_key_here'
+app = Flask(__name__)
+app.secret_key = 'b2e07e5f8a1749c4b88b1f38d85e34db345d88204a6e7105c9cf6ce562f50cda'
 
-# ---------- AWS DynamoDB Configuration ----------
-dynamodb = boto3.resource('dynamodb', region_name='us-east-1')  # Update region if needed
-users_table = dynamodb.Table('users')
-appointments_table = dynamodb.Table('appointments')
+# === In-memory mock data === #
+users = {}  # key: email
+appointments = []
 
-# ---------- AWS SNS Configuration ----------
-sns = boto3.client('sns', region_name='us-east-1')  # Update region if needed
+# === Helper Functions === #
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
-# ---------- Email (SMTP) Configuration ----------
-app.config['MAIL_SERVER'] = 'smtp.gmail.com'
-app.config['MAIL_PORT'] = 587
-app.config['MAIL_USE_TLS'] = True
-app.config['MAIL_USERNAME'] = 'your_email@gmail.com'       # ✅ Your Gmail
-app.config['MAIL_PASSWORD'] = 'your_app_password'          # ✅ Use Gmail App Password
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
 
-mail = Mail(app)
+def doctor_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if session.get('user_type') != 'doctor':
+            flash('Doctor access only', 'error')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
 
-# ---------- Routes ----------
-
+# === Routes === #
 @app.route('/')
-def home():
-    return render_template('home.html')
-
+def index():
+    return render_template('index.html')
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if request.method == 'POST':
-        role = request.form['role']
-        username = request.form['username']  # Assuming it's an email
-        password = request.form['password']
+        email = request.form['email']
+        if email in users:
+            flash("User already exists.", "error")
+            return redirect(url_for('register'))
 
-        # Check if user exists
-        response = users_table.get_item(Key={'username': username})
-        if 'Item' in response:
-            return "User already exists!"
+        user_id = str(uuid.uuid4())
+        user_type = request.form['user_type']
+        user = {
+            'user_id': user_id,
+            'name': request.form['name'],
+            'email': email,
+            'phone': request.form['phone'],
+            'password': hash_password(request.form['password']),
+            'user_type': user_type,
+            'created_at': datetime.now().isoformat()
+        }
 
-        # Add new user
-        users_table.put_item(Item={
-            'username': username,
-            'password': password,
-            'role': role
-        })
+        if user_type == 'doctor':
+            user['specialization'] = request.form['specialization']
+            user['license_number'] = request.form['license_number']
 
-        # Send Welcome Email
-        try:
-            msg = Message(
-                subject="Welcome to MedTrack!",
-                sender=app.config['MAIL_USERNAME'],
-                recipients=[username],
-                body=f"Hello {username},\n\nThank you for registering as a {role} on MedTrack."
-            )
-            mail.send(msg)
-        except Exception as e:
-            print(f"Email error: {e}")
-
-        return redirect('/login')
+        users[email] = user
+        flash("Registration successful. Please login.", "success")
+        return redirect(url_for('login'))
 
     return render_template('register.html')
-
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
+        email = request.form['email']
         password = request.form['password']
+        user_type = request.form['user_type']
 
-        response = users_table.get_item(Key={'username': username})
-        user = response.get('Item')
-
-        if user and user['password'] == password:
-            session['username'] = username
-            session['role'] = user['role']
-            return redirect(f"/{user['role']}")
-        return "Invalid credentials!"
+        user = users.get(email)
+        if user and user['password'] == hash_password(password) and user['user_type'] == user_type:
+            session['user_id'] = user['user_id']
+            session['user_type'] = user['user_type']
+            session['name'] = user['name']
+            session['email'] = user['email']
+            if user_type == 'doctor':
+                return redirect(url_for('doctor_dashboard'))
+            else:
+                return redirect(url_for('patient_dashboard'))
+        else:
+            flash("Invalid credentials", "error")
 
     return render_template('login.html')
 
-
-@app.route('/doctor')
-def doctor_dashboard():
-    if 'role' in session and session['role'] == 'doctor':
-        response = appointments_table.scan()
-        appointments = [a for a in response.get('Items', []) if a['doctor_email'] == session['username']]
-        return render_template('doctor_dashboard.html', username=session['username'], appointments=appointments)
-    return redirect('/login')
-
-
-@app.route('/patient')
+@app.route('/patient/dashboard')
+@login_required
 def patient_dashboard():
-    if 'role' in session and session['role'] == 'patient':
-        response = appointments_table.scan()
-        appointments = [a for a in response.get('Items', []) if a['patient_email'] == session['username']]
-        return render_template('patient_dashboard.html', username=session['username'], appointments=appointments)
-    return redirect('/login')
+    if session['user_type'] != 'patient':
+        return redirect(url_for('login'))
 
+    upcoming = []
+    past = []
+    now = datetime.now()
 
-@app.route('/book', methods=['GET', 'POST'])
+    for apt in appointments:
+        if apt['patient_id'] == session['user_id']:
+            apt_time = datetime.fromisoformat(apt['appointment_datetime'])
+            if apt_time > now:
+                upcoming.append(apt)
+            else:
+                past.append(apt)
+
+    return render_template('patient_dashboard.html', 
+                           upcoming_appointments=upcoming,
+                           past_appointments=past)
+
+@app.route('/doctor/dashboard')
+@login_required
+@doctor_required
+def doctor_dashboard():
+    today = datetime.now().date()
+    today_apts = []
+    upcoming_apts = []
+
+    for apt in appointments:
+        if apt['doctor_id'] == session['user_id']:
+            apt_date = datetime.fromisoformat(apt['appointment_datetime']).date()
+            if apt_date == today:
+                today_apts.append(apt)
+            elif apt_date > today:
+                upcoming_apts.append(apt)
+
+    return render_template('doctor_dashboard.html',
+                           today_appointments=today_apts,
+                           upcoming_appointments=upcoming_apts)
+
+@app.route('/book-appointment', methods=['GET', 'POST'])
+@login_required
 def book_appointment():
-    if 'role' not in session or session['role'] != 'patient':
-        return redirect('/login')
+    if session['user_type'] != 'patient':
+        return redirect(url_for('login'))
 
     if request.method == 'POST':
-        doctor_email = request.form['doctor_email']
-        patient_email = session['username']
-        date = request.form['date']
-        reason = request.form['reason']
+        doc_id = request.form['doctor_id']
+        doctor = next((u for u in users.values() if u['user_id'] == doc_id), None)
+        if not doctor:
+            flash("Doctor not found", "error")
+            return redirect(url_for('book_appointment'))
 
-        appointment_id = str(uuid.uuid4())
+        apt = {
+            'appointment_id': str(uuid.uuid4()),
+            'patient_id': session['user_id'],
+            'patient_name': session['name'],
+            'doctor_id': doctor['user_id'],
+            'doctor_name': doctor['name'],
+            'appointment_datetime': request.form['appointment_datetime'],
+            'reason': request.form['reason'],
+            'status': 'scheduled',
+            'created_at': datetime.now().isoformat()
+        }
+        appointments.append(apt)
+        flash("Appointment booked successfully!", "success")
+        return redirect(url_for('patient_dashboard'))
 
-        # Save appointment to DynamoDB
-        appointments_table.put_item(Item={
-            'appointment_id': appointment_id,
-            'doctor_email': doctor_email,
-            'patient_email': patient_email,
-            'date': date,
-            'reason': reason,
-            'timestamp': datetime.utcnow().isoformat()
-        })
+    # List of available doctors
+    doctor_list = [u for u in users.values() if u['user_type'] == 'doctor']
+    return render_template('book_appointment.html', doctors=doctor_list)
 
-        # Send Email Notification to Doctor
-        try:
-            msg = Message(
-                subject="New Appointment Booked",
-                sender=app.config['MAIL_USERNAME'],
-                recipients=[doctor_email],
-                body=f"You have a new appointment from {patient_email} on {date}.\nReason: {reason}"
-            )
-            mail.send(msg)
-        except Exception as e:
-            print(f"Email error: {e}")
+@app.route('/appointment-history')
+@login_required
+def appointment_history():
+    user_id = session['user_id']
+    role = session['user_type']
+    user_appointments = []
 
-        # Send SMS Notification using SNS (number must be verified in AWS SNS sandbox)
-        try:
-            sns.publish(
-                PhoneNumber='+15555555555',  # Replace with actual/verified number
-                Message=f"New appointment: {patient_email} -> {doctor_email} on {date}"
-            )
-        except Exception as e:
-            print(f"SNS error: {e}")
+    for apt in appointments:
+        if (role == 'patient' and apt['patient_id'] == user_id) or \
+           (role == 'doctor' and apt['doctor_id'] == user_id):
+            user_appointments.append(apt)
 
-        return "Appointment booked successfully!"
-
-    return render_template('book_appointment.html')
-
+    return render_template('appointment_history.html', appointments=user_appointments)
 
 @app.route('/logout')
 def logout():
     session.clear()
-    return redirect('/')
+    flash("Logged out successfully.", "success")
+    return redirect(url_for('index'))
 
-
-if _name_ == '_main_':
+if __name__ == '__main__':
     app.run(debug=True)
